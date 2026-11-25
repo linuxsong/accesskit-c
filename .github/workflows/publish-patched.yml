@@ -1,0 +1,140 @@
+name: Publish patched C bindings
+
+on:
+  push:
+    tags:
+      - atspi-teardown-v1
+
+permissions:
+  contents: read
+
+env:
+  VERSION: '0.23.2+ambi.1'
+  BUILD_IMAGE: docker.io/library/rust@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f
+
+jobs:
+  linux:
+    name: Reproduce Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build twice in separate containers and compare archives
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          archive="accesskit-c-${VERSION/+/-}-linux-$ARCH.tar.gz"
+          scratch=$(mktemp -d)
+          mkdir -p "$scratch/first" "$scratch/second" release
+          for build in first second; do
+            docker run --rm --platform "linux/$ARCH" \
+              --mount "type=bind,src=$PWD,dst=/src,readonly" \
+              --mount "type=bind,src=$scratch/$build,dst=/output" \
+              --env VERSION --env BUILD_IMAGE --env SOURCE_COMMIT \
+              --workdir /src "$BUILD_IMAGE" \
+              sh .github/scripts/package-linux.sh "$TARGET" "$archive" /output
+          done
+          cmp "$scratch/first/$archive" "$scratch/second/$archive"
+          cp "$scratch/first/$archive" release/
+          (
+            cd release
+            sha256sum "$archive" > "$archive.sha256"
+          )
+          {
+            printf '# AccessKit C %s for Linux %s\n\n' "$VERSION" "$ARCH"
+            printf '\x60\x60\x60text\n'
+            cat "$scratch/first/build.txt"
+            cat "release/$archive.sha256"
+            printf 'Reproducibility: two fresh containers produced byte-identical archives (cmp).\n'
+            printf '\x60\x60\x60\n'
+          } > "release/BUILD-MANIFEST-linux-$ARCH.md"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: release/
+          if-no-files-found: error
+
+  desktop:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            library: libaccesskit.dylib
+          - platform: windows-amd64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            library: accesskit.dll
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.90.0'
+          target: ${{ matrix.target }}
+      - name: Build library and package it
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          LIBRARY: ${{ matrix.library }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+          mkdir -p package release
+          cp "target/$TARGET/release/$LIBRARY" include/accesskit.h LICENSE-APACHE LICENSE-MIT LICENSE.chromium package/
+          printf '%s\n' "$VERSION" > package/VERSION
+          archive="accesskit-c-${VERSION/+/-}-$PLATFORM.tar.gz"
+          tar -C package -czf "release/$archive" .
+          cd release
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.platform }}
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, desktop]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release/
+          merge-multiple: true
+      - name: Publish checksummed archives and build manifests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "AccessKit C $VERSION" \
+            --notes "AT-SPI object subtree teardown fix. See the per-architecture build manifests." \
+            release/* LICENSE-APACHE LICENSE-MIT LICENSE.chromium

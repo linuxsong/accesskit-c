@@ -40,3 +40,7 @@ opt-level = "z"
 codegen-units = 1
 panic = "abort"
 debug = true
+
+[patch.crates-io]
+accesskit = { git = "https://github.com/linuxsong/accesskit", rev = "3edb2b23b85b0b5f82f7bab6144b62805cec7bd2" }
+accesskit_unix = { git = "https://github.com/linuxsong/accesskit", rev = "3edb2b23b85b0b5f82f7bab6144b62805cec7bd2" }
